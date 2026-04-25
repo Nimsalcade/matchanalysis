@@ -1,0 +1,8 @@
+streamlit==1.42.0
+pandas
+matplotlib
+seaborn
+mplsoccer==1.2.4
+scikit-learn
+highlight_text
+Pillow
