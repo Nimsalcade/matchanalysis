@@ -685,8 +685,8 @@ hTotalShots = len(hShotsdf)
 aTotalShots = len(aShotsdf)
 hShotsOnT = len(hSavedf) + hgoal_count
 aShotsOnT = len(aSavedf) + agoal_count
-hxGpSh = round(hxg/hTotalShots, 2)
-axGpSh = round(axg/hTotalShots, 2)
+hxGpSh = round(hxg/hTotalShots, 2) if hTotalShots else 0.0
+axGpSh = round(axg/aTotalShots, 2) if aTotalShots else 0.0
 # Center Goal point
 given_point = (105, 34)
 # Calculate distances
@@ -756,12 +756,19 @@ def plot_shotmap(ax):
       agoal = (agoal_count/(hgoal_count+agoal_count))*20
 
     # normalizing the stats
-    shooting_stats_normalized_home = [hgoal, (hxg/(hxg+axg))*20, (hxgot/(hxgot+axgot))*20,
-                                      (hTotalShots/(hTotalShots+aTotalShots))*20, (hShotsOnT/(hShotsOnT+aShotsOnT))*20, (hxGpSh/(hxGpSh+axGpSh))*20,
-                                      (home_average_shot_distance/(home_average_shot_distance+away_average_shot_distance))*20]
-    shooting_stats_normalized_away = [agoal, (axg/(hxg+axg))*20, (axgot/(hxgot+axgot))*20,
-                                      (aTotalShots/(hTotalShots+aTotalShots))*20, (aShotsOnT/(hShotsOnT+aShotsOnT))*20, (axGpSh/(hxGpSh+axGpSh))*20,
-                                      (away_average_shot_distance/(home_average_shot_distance+away_average_shot_distance))*20]
+    def safe_stat_split(home_v, away_v):
+      total = home_v + away_v
+      if not np.isfinite(total) or total == 0:
+        return 10.0, 10.0
+      return (home_v / total) * 20, (away_v / total) * 20
+
+    split_values = [safe_stat_split(*pair) for pair in (
+        (hxg, axg), (hxgot, axgot), (hTotalShots, aTotalShots),
+        (hShotsOnT, aShotsOnT), (hxGpSh, axGpSh),
+        (home_average_shot_distance, away_average_shot_distance),
+    )]
+    shooting_stats_normalized_home = [hgoal] + [pair[0] for pair in split_values]
+    shooting_stats_normalized_away = [agoal] + [pair[1] for pair in split_values]
 
     # definig the start point
     start_x = 42.5
