@@ -8,6 +8,7 @@ import io
 import sys
 import time
 import re
+from match_sources import fetch_whoscored, fetch_fotmob, fixture_names_match, SourceError
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -302,7 +303,7 @@ with st.sidebar:
         radio_options,
         index=0,
         help="Select a specific team to generate a single-team report. "
-             "Team names appear automatically once you upload an HTML file.",
+             "Team names appear after fetching or uploading the match HTML.",
     )
 
     # Derive the side keyword from the selection
@@ -326,14 +327,15 @@ with st.sidebar:
         if st.button("🗑 Clear", use_container_width=True):
             st.session_state.match_count = 1
             st.session_state.results = []
+            st.session_state.pop("tactical_result", None)
             st.session_state.detected_home = ""
             st.session_state.detected_away = ""
             st.rerun()
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.caption(
-        "**Tip:** Upload a match HTML first — the app detects team names "
-        "and populates the radio options above so you can pick which team to scout."
+        "**Tip:** Paste a WhoScored Live URL and a FotMob match URL, then choose Fetch. "
+        "If the websites restrict access, upload the saved HTML and enter the statistics manually."
     )
 
 
@@ -357,114 +359,246 @@ st.markdown("<hr/>", unsafe_allow_html=True)
 # ─────────────────────────────────────────────
 # MAIN — MATCH INPUT GRID
 # ─────────────────────────────────────────────
-match_inputs = []   # list of dicts per match
+match_inputs = []   # downloaded or uploaded bytes, match label and verified metric values
 
 for i in range(st.session_state.match_count):
     st.markdown(f"<div class='match-label'>MATCH {i + 1}</div>", unsafe_allow_html=True)
-
     with st.container():
-        col_file, col_del = st.columns([8, 1])
-
-        with col_file:
+        source_mode = st.radio(
+            f"Match {i + 1} input", ["Fetch by URL", "Upload saved HTML"],
+            key=f"match_mode_{i}", horizontal=True,
+        )
+        uploaded = None
+        html_bytes = None
+        who_url = ""
+        if source_mode == "Fetch by URL":
+            who_url = st.text_input(
+                "WhoScored Live match URL", key=f"whoscored_url_{i}",
+                placeholder="https://www.whoscored.com/matches/1995784/live/...",
+            ).strip()
+            cached_source = st.session_state.get(f"match_download_{i}")
+            if cached_source and cached_source.get("url") == who_url:
+                html_bytes = cached_source["html"]
+                st.caption("WhoScored HTML downloaded and stored for this session.")
+            elif cached_source and who_url:
+                st.warning("The URL changed. Fetch again to analyse this match.")
+        else:
             uploaded = st.file_uploader(
-                f"WhoScored HTML — Match {i + 1}",
-                type=["html"],
-                key=f"file_{i}",
-                label_visibility="collapsed",
+                "WhoScored saved HTML", type=["html", "htm"], key=f"file_{i}",
             )
-        with col_del:
-            if st.session_state.match_count > 1:
-                if st.button("✕", key=f"del_{i}", help="Remove this match"):
-                    st.session_state.match_count -= 1
-                    st.rerun()
+            if uploaded is not None:
+                html_bytes = uploaded.getvalue()
 
-        # ── Auto-detect team names from uploaded file ─────────────────
+        fotmob_url = st.text_input(
+            "FotMob match URL — xG and xGOT", key=f"fotmob_url_{i}",
+            placeholder="https://www.fotmob.com/matches/...#123456:tab=stats",
+        ).strip()
+        previous_fotmob = st.session_state.get(f"fotmob_fetch_{i}")
+        if previous_fotmob and previous_fotmob["url"] != fotmob_url:
+            # Clearing an outdated auto-filled number prevents silent misattribution.
+            previous_stats = previous_fotmob["stats"]
+            for k, old_value in (("hxg", previous_stats.home_xg),
+                                 ("axg", previous_stats.away_xg),
+                                 ("hxgot", previous_stats.home_xgot),
+                                 ("axgot", previous_stats.away_xgot)):
+                field = f"{k}_{i}"
+                if old_value is not None and st.session_state.get(field) == f"{old_value:.2f}":
+                    st.session_state[field] = ""
+            st.session_state.pop(f"fotmob_fetch_{i}", None)
+        browser_option = st.checkbox(
+            "Try normal browser rendering when a page needs JavaScript",
+            value=False, key=f"browser_option_{i}",
+            help="Optional: requires Playwright and Chromium. Cannot bypass HTTP blocks or challenges.",
+        )
+        if st.button("Fetch match sources", key=f"fetch_{i}", use_container_width=True):
+            with st.spinner("Reading the supplied match pages…"):
+                if source_mode == "Fetch by URL":
+                    if not who_url:
+                        st.warning("Enter a WhoScored URL, or switch to saved HTML upload.")
+                    else:
+                        try:
+                            fetched = fetch_whoscored(who_url, browser_fallback=browser_option)
+                            st.session_state[f"match_download_{i}"] = {"url": who_url, "html": fetched}
+                            html_bytes = fetched
+                            st.success("WhoScored events fetched.")
+                        except SourceError as exc:
+                            st.error(f"WhoScored: {exc}")
+                if fotmob_url:
+                    try:
+                        stats = fetch_fotmob(fotmob_url, browser_fallback=browser_option)
+                        check = None
+                        if html_bytes:
+                            try:
+                                from tactic_decoder import load_match as _parse_fixture
+                                fixture = _parse_fixture(html_bytes)["matchCentreData"]
+                                check = fixture_names_match(fixture["home"]["name"],
+                                                            fixture["away"]["name"], stats)
+                            except (ValueError, TypeError, KeyError):
+                                pass
+                        if check is False:
+                            st.error("FotMob and WhoScored identify different home/away teams. "
+                                     "No statistics were imported.")
+                        else:
+                            st.session_state[f"fotmob_fetch_{i}"] = {"url": fotmob_url, "stats": stats}
+                            values = {"hxg": stats.home_xg, "axg": stats.away_xg,
+                                      "hxgot": stats.home_xgot, "axgot": stats.away_xgot}
+                            for name, value in values.items():
+                                if value is not None:
+                                    st.session_state[f"{name}_{i}"] = f"{value:.2f}"
+                            if check is None:
+                                st.info("Team names could not be cross-checked; confirm home/away order.")
+                            if stats.complete:
+                                st.success("FotMob xG and xGOT fetched for both teams.")
+                            else:
+                                st.warning("FotMob returned partial stats. Fill in any empty values manually.")
+                    except SourceError as exc:
+                        st.warning(f"FotMob: {exc} Enter missing values below.")
+                else:
+                    st.info("No FotMob URL supplied; use the manual statistics fields below.")
+
         home_name, away_name = "", ""
-        if uploaded is not None:
-            html_bytes = uploaded.getvalue()
-            home_name, away_name = extract_team_names(html_bytes, uploaded.name)
-            # Store the first successful detection for the sidebar radio
+        if html_bytes:
+            try:
+                from tactic_decoder import load_match as _load_live_match
+                _parsed_match = _load_live_match(html_bytes)
+                home_name = _parsed_match["matchCentreData"]["home"]["name"]
+                away_name = _parsed_match["matchCentreData"]["away"]["name"]
+            except (KeyError, ValueError, TypeError, IndexError):
+                home_name, away_name = extract_team_names(html_bytes,
+                    uploaded.name if uploaded else "")
             if home_name and away_name:
+                st.caption(f"Match event teams: **{home_name}** (H) vs **{away_name}** (A)")
                 if not st.session_state.detected_home:
                     st.session_state.detected_home = home_name
                     st.session_state.detected_away = away_name
-                    st.rerun()   # rerun so sidebar picks up the names
-                if home_name and away_name:
-                    st.caption(f"🏟️  Detected: **{home_name}** (H) vs **{away_name}** (A)")
             else:
-                st.warning("⚠️ Could not detect team names from this file.")
+                st.warning("Team names could not be read; check the saved WhoScored HTML.")
 
-        # Optional match label — auto-populate if names detected
-        default_label = (
-            f"{home_name} vs {away_name}" if home_name and away_name
-            else f"Match {i + 1}"
-        )
+        stats_cache = st.session_state.get(f"fotmob_fetch_{i}")
+        if stats_cache and stats_cache["url"] == fotmob_url:
+            stats = stats_cache["stats"]
+            st.caption(f"FotMob source: {stats.extraction}; xG and xGOT values below can be edited.")
+
         match_label = st.text_input(
-            "Match label (optional)",
-            value=default_label,
-            key=f"label_{i}",
-            placeholder="e.g. Arsenal vs Chelsea – GW28",
+            "Match label", key=f"label_{i}",
+            placeholder="e.g. Wolfsburg vs Darmstadt",
         )
+        if not match_label.strip():
+            match_label = f"{home_name} vs {away_name}" if home_name else f"Match {i + 1}"
 
-        # ── xG / xGOT inputs (adaptive to team_focus) ────────────────
-        if team_focus == "Both Teams":
-            # Show all 4 inputs
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                home_xg = st.number_input(
-                    f"{home_name or 'Home'} xG", min_value=0.0, max_value=10.0,
-                    value=0.89, step=0.01, format="%.2f", key=f"hxg_{i}"
-                )
-            with c2:
-                home_xgot = st.number_input(
-                    f"{home_name or 'Home'} xGOT", min_value=0.0, max_value=10.0,
-                    value=0.56, step=0.01, format="%.2f", key=f"hxgot_{i}"
-                )
-            with c3:
-                away_xg = st.number_input(
-                    f"{away_name or 'Away'} xG", min_value=0.0, max_value=10.0,
-                    value=1.09, step=0.01, format="%.2f", key=f"axg_{i}"
-                )
-            with c4:
-                away_xgot = st.number_input(
-                    f"{away_name or 'Away'} xGOT", min_value=0.0, max_value=10.0,
-                    value=1.13, step=0.01, format="%.2f", key=f"axgot_{i}"
-                )
-        else:
-            # Single team — only 2 inputs, labelled with the selected team
-            focus_label = (
-                st.session_state.detected_home if team_focus_side == "home"
-                else st.session_state.detected_away
-            ) or ("Home" if team_focus_side == "home" else "Away")
-            c1, c2 = st.columns(2)
-            with c1:
-                focus_xg = st.number_input(
-                    f"{focus_label} xG", min_value=0.0, max_value=10.0,
-                    value=0.89, step=0.01, format="%.2f", key=f"fxg_{i}"
-                )
-            with c2:
-                focus_xgot = st.number_input(
-                    f"{focus_label} xGOT", min_value=0.0, max_value=10.0,
-                    value=0.56, step=0.01, format="%.2f", key=f"fxgot_{i}"
-                )
-            # Map to home/away based on which side is focused
-            if team_focus_side == "home":
-                home_xg, home_xgot = focus_xg, focus_xgot
-                away_xg, away_xgot = 0.0, 0.0
-            else:
-                home_xg, home_xgot = 0.0, 0.0
-                away_xg, away_xgot = focus_xg, focus_xgot
+        st.markdown("**Match statistics (home and away)**")
+        st.caption("Use FotMob Fetch to populate these fields; edit manually if access is blocked. "
+                   "Blank means unknown, never zero. The legacy PDF renderer needs all four fields.")
+        c1, c2, c3, c4 = st.columns(4)
+        stat_fields = (
+            (c1, "hxg", f"{home_name or 'Home'} xG"),
+            (c2, "hxgot", f"{home_name or 'Home'} xGOT"),
+            (c3, "axg", f"{away_name or 'Away'} xG"),
+            (c4, "axgot", f"{away_name or 'Away'} xGOT"),
+        )
+        parsed_values = {}
+        for column, name, label in stat_fields:
+            with column:
+                value = st.text_input(label, key=f"{name}_{i}", placeholder="Not available")
+                if value.strip():
+                    try:
+                        number = float(value)
+                        if not (0 <= number <= 20):
+                            raise ValueError("out of range")
+                        parsed_values[name] = number
+                    except ValueError:
+                        parsed_values[name] = None
+                        st.error("Enter 0–20 (e.g. 2.28)")
+                else:
+                    parsed_values[name] = None
 
         match_inputs.append({
-            "file": uploaded,
-            "label": match_label,
-            "home_xg": home_xg,
-            "home_xgot": home_xgot,
-            "away_xg": away_xg,
-            "away_xgot": away_xgot,
+            "html_bytes": html_bytes, "label": match_label,
+            "home_name": home_name, "away_name": away_name,
+            "home_xg": parsed_values["hxg"], "home_xgot": parsed_values["hxgot"],
+            "away_xg": parsed_values["axg"], "away_xgot": parsed_values["axgot"],
         })
-
     st.markdown("<hr/>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# PRECISION TACTICAL DECODER (independent of the legacy PNG/PDF pipeline)
+# ─────────────────────────────────────────────
+with st.expander("Tactical decoder — event evidence and match phases", expanded=False):
+    st.caption(
+        "Reads the embedded WhoScored events directly. The recorded formation is confirmed; "
+        "pass receivers and possession segments are estimates. Off-ball shapes need tracking/video."
+    )
+    tactical_team = st.text_input(
+        "Team to decode across all fetched/uploaded matches (regardless of home/away side)",
+        value=st.session_state.detected_home or "",
+        key="tactical_team_name",
+    )
+    if st.button("Decode tactics from loaded match data", use_container_width=True):
+        try:
+            from tactic_decoder import analyze_match, aggregate_team, select_team, as_markdown
+            tactical_matches = [analyze_match(m["html_bytes"]) for m in match_inputs if m["html_bytes"] is not None]
+            if not tactical_matches:
+                st.error("Fetch a WhoScored match URL or upload at least one HTML file first.")
+            else:
+                tactical_aggregate = aggregate_team(tactical_matches, tactical_team)
+                st.session_state.tactical_result = {
+                    "matches": tactical_matches,
+                    "aggregate": tactical_aggregate,
+                    "team": tactical_team,
+                }
+        except (ValueError, KeyError, TypeError) as exc:
+            st.error(f"Tactical analysis failed: {exc}")
+
+    if st.session_state.get("tactical_result"):
+        from tactic_decoder import select_team, as_markdown
+        import json as _tjson
+        import pandas as _tpd
+
+        data = st.session_state.tactical_result
+        aggregation = data["aggregate"]
+        totals = aggregation["passes_total"]
+        st.markdown(f"**{aggregation['team']}** · {aggregation['match_count']} decoded match(es)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Completed passes", f"{totals['completed']}/{totals['attempts']}")
+        c2.metric("Progressive passes", totals["progressive_passes"])
+        c3.metric("Half-space receipts", totals["halfspace_passes"])
+        c4.metric("Final-third entries", totals["final_third_entries"])
+        st.download_button(
+            "Download complete tactical evidence (JSON)",
+            data=_tjson.dumps(data, ensure_ascii=False, indent=2),
+            file_name="tactical_decoder.json", mime="application/json",
+            use_container_width=True, key="download_tactical_json",
+        )
+        tabs = st.tabs([f"{m['home']} vs {m['away']}" for m in data["matches"]])
+        for tab, m in zip(tabs, data["matches"]):
+            with tab:
+                t = select_team(m, data["team"])
+                st.markdown(f"**Registered starting shape: {t['first_registered_formation']}**")
+                st.caption("Formation intervals come from the match-centre HTML, not a reconstructed off-ball shape.")
+                st.dataframe(_tpd.DataFrame(t["registered_formations"]), hide_index=True, use_container_width=True)
+                st.markdown("**Before/after registered formation changes (rates per 90)**")
+                st.dataframe(_tpd.DataFrame(t["formation_phase_comparison"]), hide_index=True, use_container_width=True)
+                st.markdown("**Passing, progression and attacking zones**")
+                st.dataframe(_tpd.DataFrame([t["passing"]]).T.rename(columns={0: "Value"}), use_container_width=True)
+                st.markdown("**Directed passing connections (inferred receptions)**")
+                st.dataframe(_tpd.DataFrame(t["top_directed_passing_connections"]), hide_index=True, use_container_width=True)
+                st.caption(t["pass_link_quality"]["warning"])
+                st.markdown("**Recorded passers in the build-up to shots**")
+                st.dataframe(_tpd.DataFrame(t["shot_sequences"]), hide_index=True, use_container_width=True)
+                st.markdown("**Player participation and on-ball positions**")
+                st.dataframe(_tpd.DataFrame(t["players"]), hide_index=True, use_container_width=True)
+                st.markdown("**15-minute event trends**")
+                st.dataframe(_tpd.DataFrame.from_dict(t["time_slices"], orient="index"), use_container_width=True)
+                st.markdown("**Defensive-event evidence**")
+                st.json(t["defence_event_proxies"], expanded=False)
+                st.download_button(
+                    "Download tactical interpretation (Markdown)",
+                    data=as_markdown(m, data["team"]),
+                    file_name=f"tactic_{m['match_id']}.md", mime="text/markdown",
+                    key=f"tactics_markdown_{m['match_id']}",
+                )
+        st.info("This report does not estimate the exact off-ball formation, high-press triggers, or rest-defence without tracking/video.")
 
 
 # ─────────────────────────────────────────────
@@ -477,20 +611,28 @@ generate_btn = st.button(
 )
 
 if generate_btn:
-    valid = [(m["file"], m) for m in match_inputs if m["file"] is not None]
+    valid = [m for m in match_inputs if m["html_bytes"] is not None]
 
     if not valid:
-        st.error("⚠️  Please upload at least one WhoScored HTML file.")
+        st.error("Load at least one WhoScored match URL or upload a saved HTML file.")
         st.stop()
 
+    # Require real, sourced values; never synthesize xG/xGOT defaults.
+    missing_stats = [m["label"] for m in valid if any(m[k] is None for k in
+        ("home_xg", "away_xg", "home_xgot", "away_xgot"))]
+    if missing_stats:
+        st.error("xG and xGOT are missing or invalid for: " + ", ".join(missing_stats) +
+                 ". Fetch from FotMob or enter the four numbers manually.")
+        st.stop()
     all_generated_images = []   # flat list of image paths, in order
     errors = []
+    st.session_state.results = []
 
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    for idx, (html_file, cfg) in enumerate(valid):
-        html_bytes = html_file.getvalue()
+    for idx, cfg in enumerate(valid):
+        html_bytes = cfg["html_bytes"]
 
         # ── Determine --team arg from sidebar selection ───────────────
         team_arg = team_focus_side   # "both", "home", or "away"
@@ -557,7 +699,7 @@ if generate_btn:
     if all_generated_images:
         st.session_state.pdf_bytes = images_to_pdf(all_generated_images)
         if len(valid) == 1:
-            st.session_state.pdf_name = f"{valid[0][1]['label'].replace(' ', '_')}_report.pdf"
+            st.session_state.pdf_name = f"{valid[0]['label'].replace(' ', '_')}_report.pdf"
         else:
             st.session_state.pdf_name = f"scout_report_{len(valid)}_matches.pdf"
     else:
@@ -617,6 +759,6 @@ if "results" in st.session_state and st.session_state.results:
 st.markdown("<hr/>", unsafe_allow_html=True)
 st.caption(
     "**Note for PostMatchDashboard.py maintainers:** This app passes a `--team [both|home|away]` "
-    "argument to your analysis script. Team names are auto-detected from the HTML and the user "
-    "selects which team to focus on via a radio button. See README for details."
+    "argument to your analysis script. You can provide a WhoScored Live URL or upload saved HTML; "
+    "FotMob xG/xGOT can be fetched from its match page or entered manually. See README."
 )
