@@ -6,3 +6,5 @@ mplsoccer==1.2.4
 scikit-learn
 highlight_text
 Pillow
+requests
+beautifulsoup4
