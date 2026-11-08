@@ -6,14 +6,18 @@
   ]);
   const origin = window.location.origin;
   if (!appOrigins.has(origin)) return;
+  const hostedAppFrame = origin === "https://matchareport.streamlit.app" &&
+    window.location.pathname === "/~/+/";
+  if (window !== window.top && !hostedAppFrame) return;
 
   const pending = new Set();
   function isFetchFrame(source) {
     return Array.from(document.querySelectorAll("iframe[src]")).some((frame) => {
       if (frame.contentWindow !== source) return false;
       const url = new URL(frame.src, window.location.href);
+      const componentPath = hostedAppFrame ? url.pathname.replace(/^\/~\/\+\//, "/") : url.pathname;
       return url.origin === origin &&
-        /^\/component\/(?:[^/]+\.)?browser_fetch_component(?:\/|$)/.test(url.pathname);
+        /^\/component\/(?:[^/]+\.)?browser_fetch_component(?:\/|$)/.test(componentPath);
     });
   }
 

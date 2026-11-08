@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MatchAnalysis Browser Fetch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Import the WhoScored event payload for a match you select in MatchAnalysis.",
   "permissions": ["scripting"],
   "host_permissions": ["https://www.whoscored.com/*", "https://whoscored.com/*"],
@@ -9,6 +9,7 @@
   "content_scripts": [
     {
       "matches": ["https://matchareport.streamlit.app/*", "http://localhost/*", "http://127.0.0.1/*"],
+      "all_frames": true,
       "js": ["app-bridge.js"]
     }
   ]

@@ -23,8 +23,10 @@ function liveMatch(url) {
 
 function allowedSender(sender) {
   try {
-    return sender.id === chrome.runtime.id && sender.frameId === 0 &&
-      APP_ORIGINS.has(new URL(sender.url).origin);
+    const {origin, pathname} = new URL(sender.url);
+    const hostedAppFrame = origin === "https://matchareport.streamlit.app" && pathname === "/~/+/";
+    return sender.id === chrome.runtime.id && APP_ORIGINS.has(origin) &&
+      (sender.frameId === 0 || hostedAppFrame);
   } catch {
     return false;
   }
