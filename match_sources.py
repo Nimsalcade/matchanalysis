@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
+from tactic_decoder import load_match
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 TIMEOUT = (5, 25)
@@ -47,7 +48,10 @@ def check_source_url(raw: str, site: str) -> str:
     if site not in allowed:
         raise SourceError(f"Unknown source type: {site}")
     raw = (raw or "").strip()
-    parts = urlsplit(raw)
+    try:
+        parts = urlsplit(raw)
+    except ValueError as exc:
+        raise SourceError(f"Enter a full HTTPS {site} match URL.") from exc
     if parts.scheme != "https" or parts.hostname not in {allowed[site], allowed[site][4:]}:
         raise SourceError(f"Enter a full HTTPS {site} match URL.")
     try:
@@ -84,7 +88,7 @@ def _http_html(url: str, site: str, session=None) -> bytes:
                 continue
             if resp.status_code in (401, 403, 429):
                 raise SourceError(f"{site.title()} returned HTTP {resp.status_code}. "
-                                  "Automated access is unavailable; use the file/manual fallback.")
+                                  "The server could not access this page.")
             resp.raise_for_status()
             kind = resp.headers.get("Content-Type", "").lower()
             if kind and not any(k in kind for k in ("html", "text/plain", "application/xhtml")):
@@ -111,7 +115,7 @@ def _browser_html(url: str, site: str) -> bytes:
     third-party proxy sites. Playwright and a browser installation are optional.
     """
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as BrowserTimeout
+        from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout, sync_playwright
     except ImportError as exc:
         raise SourceError("Browser rendering requires 'pip install playwright' and "
                           "'python -m playwright install chromium'.") from exc
@@ -141,24 +145,42 @@ def _browser_html(url: str, site: str) -> bytes:
                 browser.close()
     except BrowserTimeout as exc:
         raise SourceError("Browser rendering timed out.") from exc
+    except BrowserError as exc:
+        raise SourceError("Browser rendering failed. Check that Chromium is installed.") from exc
+
+
+def whoscored_teams(html: bytes, url: str = "") -> tuple[str, str]:
+    """Validate the event payload and its fixture before handing it to either report."""
+    try:
+        match = load_match(html)
+        centre = match["matchCentreData"]
+        home, away = centre["home"]["name"], centre["away"]["name"]
+        events = centre["events"]
+    except (KeyError, ValueError, TypeError) as exc:
+        raise SourceError("This WhoScored page has no readable match-centre event data.") from exc
+    if not isinstance(events, list) or not events:
+        raise SourceError("This WhoScored page has no match-centre events.")
+    if not all(isinstance(name, str) and name.strip() for name in (home, away)):
+        raise SourceError("Team names are missing from the WhoScored event data.")
+    if url:
+        fixture_id = urlsplit(check_source_url(url, "whoscored")).path.split("/")[2]
+        if str(match.get("matchId")) != fixture_id:
+            raise SourceError(f"This WhoScored HTML belongs to a different fixture than match {fixture_id}.")
+    return home, away
 
 
 def fetch_whoscored(url: str, browser_fallback: bool = False, session=None) -> bytes:
     url = check_source_url(url, "whoscored")
+    html = _http_html(url, "whoscored", session=session)
     try:
-        html = _http_html(url, "whoscored", session=session)
-        if b'matchCentreData' in html and b'require.config.params' in html:
-            return html
-        if not browser_fallback:
-            raise SourceError("WhoScored returned a page without embedded event data. "
-                              "Enable ordinary browser rendering or upload saved HTML.")
+        whoscored_teams(html, url)
     except SourceError:
         if not browser_fallback:
             raise
+    else:
+        return html
     html = _browser_html(url, "whoscored")
-    if b'matchCentreData' not in html or b'require.config.params' not in html:
-        raise SourceError("WhoScored browser page has no complete match event payload; "
-                          "upload a saved Live match HTML instead.")
+    whoscored_teams(html, url)
     return html
 
 
@@ -295,20 +317,17 @@ def parse_fotmob_stats(html: str | bytes, source: str = "uploaded FotMob HTML") 
 
 def fetch_fotmob(url: str, browser_fallback: bool = False, session=None) -> FotMobStats:
     url = check_source_url(url, "fotmob")
-    error = None
+    result = parse_fotmob_stats(_http_html(url, "fotmob", session=session), url)
+    if result.complete or not browser_fallback:
+        return result
     try:
-        html = _http_html(url, "fotmob", session=session)
-        result = parse_fotmob_stats(html, url)
-        if result.complete or not browser_fallback:
-            return result
-    except SourceError as exc:
-        error = exc
-        if not browser_fallback:
+        rendered = parse_fotmob_stats(_browser_html(url, "fotmob"), url)
+    except SourceError:
+        if result.home_xg is None and result.home_xgot is None:
             raise
-    html = _browser_html(url, "fotmob")
-    result = parse_fotmob_stats(html, url)
-    if not any(v is not None for v in (result.home_xg, result.home_xgot)) and error:
-        raise SourceError(f"No accessible FotMob stats ({error}).")
+    else:
+        if rendered.complete or (result.home_xg is None and result.home_xgot is None):
+            return rendered
     return result
 
 
@@ -318,7 +337,8 @@ def fixture_names_match(home: str, away: str, stats: FotMobStats) -> bool | None
         return None
     def normalize(s):
         base = unicodedata.normalize("NFKD", s.casefold())
-        return "".join(c for c in base if c.isalnum() and not unicodedata.combining(c))
+        name = "".join(c for c in base if c.isalnum() and not unicodedata.combining(c))
+        return {"bayernmunich": "bayernmunchen"}.get(name, name)
     def equivalent(a, b):
         a, b = normalize(a), normalize(b)
         return a == b or (min(len(a), len(b)) >= 5 and (a.endswith(b) or b.endswith(a)))

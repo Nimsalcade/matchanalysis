@@ -7,8 +7,18 @@ import tempfile
 import io
 import sys
 import time
-import re
-from match_sources import fetch_whoscored, fetch_fotmob, fixture_names_match, SourceError
+from pathlib import Path
+from uuid import uuid4
+from streamlit.components.v1 import declare_component
+from match_sources import (
+    MAX_RESPONSE_BYTES, SourceError, check_source_url, fetch_fotmob,
+    fetch_whoscored, fixture_names_match, whoscored_teams,
+)
+
+fetch_in_browser = declare_component(
+    "browser_fetch_component",
+    path=str(Path(__file__).with_name("browser_fetch_component")),
+)
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -182,82 +192,20 @@ def images_to_pdf(image_paths: list) -> bytes:
     return buf.read()
 
 
-def _parse_score_title(title_text: str) -> tuple:
-    """Try to extract (home, away) from a string like
-    'Manchester United 2-0 Manchester City - Premier League …'.
-    Returns ("", "") on failure.
-    """
-    m = re.match(r'^(.+?)\s+(\d+\s*-\s*\d+)\s+(.+?)\s*-\s*.+$', title_text)
-    if m:
-        home, away = m.group(1).strip(), m.group(3).strip()
-        if home and away:
-            return home, away
-    return "", ""
+STAT_ATTRIBUTES = {
+    "hxg": "home_xg", "axg": "away_xg", "hxgot": "home_xgot", "axgot": "away_xgot",
+}
 
 
-def extract_team_names(html_bytes: bytes, filename: str = "") -> tuple:
-    """Extract (home_team, away_team) from a WhoScored HTML file.
-
-    Returns a tuple of two strings. If detection fails, returns ("", "").
-
-    Detection strategy (ordered by reliability):
-      0. **Filename** — saved pages are named
-         ``"Manchester United 2-0 Manchester City - Premier League … Live.html"``.
-      1. ``<meta name="title" …>`` — searched up to 200 KB (saved pages inline
-         huge JS before <head> meta tags).
-      2. "Home vs Away" text pattern in the first 200 KB (pre-match pages).
-      3. ``<a class="team-link" …>Team</a>`` anchors — up to 1 MB.
-    """
-
-    # ── Strategy 0: filename ──────────────────────────────────────────
-    if filename:
-        # Strip extension and path
-        import os
-        base = os.path.splitext(os.path.basename(filename))[0]
-        home, away = _parse_score_title(base)
-        if home and away:
-            return home, away
-        # Also try "Home vs Away" in filename
-        m = re.match(r'^(.+?)\s+vs\.?\s+(.+?)\s*[-–]', base, re.IGNORECASE)
-        if m:
-            return m.group(1).strip(), m.group(2).strip()
-
-    text = html_bytes.decode("utf-8", errors="replace")
-    # Saved WhoScored pages inline massive JS, pushing meta tags to ~55 KB+
-    search_chunk = text[:204800]   # 200 KB
-
-    # ── Strategy 1: <meta name="title" content="…"> ──────────────────
-    meta_title = re.search(
-        r'<meta\s+name=["\']title["\']\s+content=["\']([^"\']+)["\']',
-        search_chunk,
-        re.IGNORECASE,
-    )
-    if meta_title:
-        home, away = _parse_score_title(meta_title.group(1).strip())
-        if home and away:
-            return home, away
-
-    # ── Strategy 2: "Home vs Away" text in head area ──────────────────
-    vs_pattern = re.compile(
-        r'([^"<>]{2,40})\s+vs\.?\s+([^"<>]{2,40})',
-        re.IGNORECASE,
-    )
-    for m in vs_pattern.finditer(search_chunk):
-        home = m.group(1).strip()
-        away = m.group(2).strip()
-        if re.search(r'[A-Za-z]', home) and re.search(r'[A-Za-z]', away):
-            return home, away
-
-    # ── Strategy 3: team-link <a> anchors (up to 1 MB) ────────────────
-    team_link_pattern = re.compile(
-        r'<a[^>]+class="[^"]*team-link[^"]*"[^>]*>\s*([^<]+?)\s*</a>',
-        re.IGNORECASE,
-    )
-    team_links = team_link_pattern.findall(text[:1048576])   # 1 MB
-    if len(team_links) >= 2:
-        return team_links[0].strip(), team_links[1].strip()
-
-    return "", ""
+def clear_imported_stats(index, cached):
+    """Clear only values that still match the previous automatic import."""
+    if not cached or not cached.get("applied"):
+        return
+    for field, attribute in STAT_ATTRIBUTES.items():
+        key = f"{field}_{index}"
+        value = getattr(cached["stats"], attribute)
+        if value is not None and st.session_state.get(key) == f"{value:.2f}":
+            st.session_state[key] = ""
 
 
 # ─────────────────────────────────────────────
@@ -330,12 +278,17 @@ with st.sidebar:
             st.session_state.pop("tactical_result", None)
             st.session_state.detected_home = ""
             st.session_state.detected_away = ""
+            for key in tuple(st.session_state.keys()):
+                if key.startswith(("match_mode_", "whoscored_url_", "fotmob_url_", "file_",
+                                   "match_download_", "fotmob_fetch_", "label_", "browser_",
+                                   "hxg_", "hxgot_", "axg_", "axgot_")):
+                    st.session_state.pop(key)
             st.rerun()
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.caption(
         "**Tip:** Paste a WhoScored Live URL and a FotMob match URL, then choose Fetch. "
-        "If the websites restrict access, upload the saved HTML and enter the statistics manually."
+        "If WhoScored blocks the server, use the browser companion or upload saved match-centre HTML."
     )
 
 
@@ -368,116 +321,131 @@ for i in range(st.session_state.match_count):
             f"Match {i + 1} input", ["Fetch by URL", "Upload saved HTML"],
             key=f"match_mode_{i}", horizontal=True,
         )
-        uploaded = None
-        html_bytes = None
         who_url = ""
         if source_mode == "Fetch by URL":
             who_url = st.text_input(
                 "WhoScored Live match URL", key=f"whoscored_url_{i}",
                 placeholder="https://www.whoscored.com/matches/1995784/live/...",
             ).strip()
-            cached_source = st.session_state.get(f"match_download_{i}")
-            if cached_source and cached_source.get("url") == who_url:
-                html_bytes = cached_source["html"]
-                st.caption("WhoScored HTML downloaded and stored for this session.")
-            elif cached_source and who_url:
-                st.warning("The URL changed. Fetch again to analyse this match.")
-        else:
-            uploaded = st.file_uploader(
-                "WhoScored saved HTML", type=["html", "htm"], key=f"file_{i}",
-            )
-            if uploaded is not None:
-                html_bytes = uploaded.getvalue()
 
         fotmob_url = st.text_input(
             "FotMob match URL — xG and xGOT", key=f"fotmob_url_{i}",
             placeholder="https://www.fotmob.com/matches/...#123456:tab=stats",
         ).strip()
-        previous_fotmob = st.session_state.get(f"fotmob_fetch_{i}")
-        if previous_fotmob and previous_fotmob["url"] != fotmob_url:
-            # Clearing an outdated auto-filled number prevents silent misattribution.
-            previous_stats = previous_fotmob["stats"]
-            for k, old_value in (("hxg", previous_stats.home_xg),
-                                 ("axg", previous_stats.away_xg),
-                                 ("hxgot", previous_stats.home_xgot),
-                                 ("axgot", previous_stats.away_xgot)):
-                field = f"{k}_{i}"
-                if old_value is not None and st.session_state.get(field) == f"{old_value:.2f}":
-                    st.session_state[field] = ""
-            st.session_state.pop(f"fotmob_fetch_{i}", None)
+        who_key, fot_key = f"match_download_{i}", f"fotmob_fetch_{i}"
+        who = st.session_state.get(who_key, {})
+        if who.get("url") != who_url:
+            who = {}
+        fot = st.session_state.get(fot_key, {})
+        if fot and fot["url"] != fotmob_url:
+            clear_imported_stats(i, fot)
+            st.session_state.pop(fot_key)
+            fot = {}
+
         browser_option = st.checkbox(
-            "Try normal browser rendering when a page needs JavaScript",
+            "Try server browser rendering when a page needs JavaScript",
             value=False, key=f"browser_option_{i}",
-            help="Optional: requires Playwright and Chromium. Cannot bypass HTTP blocks or challenges.",
+            help="Optional: requires Playwright and Chromium on the server.",
         )
         if st.button("Fetch match sources", key=f"fetch_{i}", use_container_width=True):
             with st.spinner("Reading the supplied match pages…"):
-                if source_mode == "Fetch by URL":
-                    if not who_url:
-                        st.warning("Enter a WhoScored URL, or switch to saved HTML upload.")
-                    else:
-                        try:
-                            fetched = fetch_whoscored(who_url, browser_fallback=browser_option)
-                            st.session_state[f"match_download_{i}"] = {"url": who_url, "html": fetched}
-                            html_bytes = fetched
-                            st.success("WhoScored events fetched.")
-                        except SourceError as exc:
-                            st.error(f"WhoScored: {exc}")
+                if who_url:
+                    try:
+                        html = fetch_whoscored(who_url, browser_fallback=browser_option)
+                        who = {"url": who_url, "html": html, "source": "server"}
+                    except SourceError as exc:
+                        who = {"url": who_url, "error": str(exc), "request_id": uuid4().hex}
+                    st.session_state[who_key] = who
                 if fotmob_url:
                     try:
                         stats = fetch_fotmob(fotmob_url, browser_fallback=browser_option)
-                        check = None
-                        if html_bytes:
-                            try:
-                                from tactic_decoder import load_match as _parse_fixture
-                                fixture = _parse_fixture(html_bytes)["matchCentreData"]
-                                check = fixture_names_match(fixture["home"]["name"],
-                                                            fixture["away"]["name"], stats)
-                            except (ValueError, TypeError, KeyError):
-                                pass
-                        if check is False:
-                            st.error("FotMob and WhoScored identify different home/away teams. "
-                                     "No statistics were imported.")
-                        else:
-                            st.session_state[f"fotmob_fetch_{i}"] = {"url": fotmob_url, "stats": stats}
-                            values = {"hxg": stats.home_xg, "axg": stats.away_xg,
-                                      "hxgot": stats.home_xgot, "axgot": stats.away_xgot}
-                            for name, value in values.items():
-                                if value is not None:
-                                    st.session_state[f"{name}_{i}"] = f"{value:.2f}"
-                            if check is None:
-                                st.info("Team names could not be cross-checked; confirm home/away order.")
-                            if stats.complete:
-                                st.success("FotMob xG and xGOT fetched for both teams.")
-                            else:
-                                st.warning("FotMob returned partial stats. Fill in any empty values manually.")
                     except SourceError as exc:
-                        st.warning(f"FotMob: {exc} Enter missing values below.")
-                else:
-                    st.info("No FotMob URL supplied; use the manual statistics fields below.")
+                        fot = {**fot, "url": fotmob_url, "error": str(exc)}
+                    else:
+                        clear_imported_stats(i, fot)
+                        fot = {"url": fotmob_url, "stats": stats, "applied": False}
+                    st.session_state[fot_key] = fot
+                if not (who_url or fotmob_url):
+                    st.info("Enter a match URL to fetch, or upload HTML and enter the statistics below.")
 
-        home_name, away_name = "", ""
-        if html_bytes:
+        uploaded = None
+        if who.get("error"):
+            st.error(f"WhoScored server fetch: {who['error']}")
             try:
-                from tactic_decoder import load_match as _load_live_match
-                _parsed_match = _load_live_match(html_bytes)
-                home_name = _parsed_match["matchCentreData"]["home"]["name"]
-                away_name = _parsed_match["matchCentreData"]["away"]["name"]
-            except (KeyError, ValueError, TypeError, IndexError):
-                home_name, away_name = extract_team_names(html_bytes,
-                    uploaded.name if uploaded else "")
-            if home_name and away_name:
-                st.caption(f"Match event teams: **{home_name}** (H) vs **{away_name}** (A)")
+                check_source_url(who_url, "whoscored")
+            except SourceError:
+                pass
+            else:
+                st.caption("With the MatchAnalysis browser extension installed, fetch the same URL from your browser.")
+                result = fetch_in_browser(
+                    url=who_url, request_id=who["request_id"], key=f"browser_fetch_{i}",
+                    default=None,
+                )
+                if (isinstance(result, dict) and result.get("url") == who_url
+                        and result.get("request_id") == who["request_id"]):
+                    if isinstance(result.get("html"), str):
+                        try:
+                            html = result["html"].encode("utf-8")
+                            if len(html) > MAX_RESPONSE_BYTES:
+                                raise SourceError("WhoScored HTML exceeds the 16 MB limit.")
+                            whoscored_teams(html, who_url)
+                        except (SourceError, UnicodeError) as exc:
+                            st.error(f"WhoScored browser fetch: {exc}")
+                        else:
+                            st.session_state[who_key] = {
+                                "url": who_url, "html": html, "source": "browser",
+                            }
+                            st.rerun()
+                    elif isinstance(result.get("error"), str):
+                        st.error(f"WhoScored browser fetch: {result['error']}")
+            st.caption("You can also upload saved HTML from this match's WhoScored Live page.")
+        if source_mode == "Upload saved HTML" or who.get("error"):
+            uploaded = st.file_uploader(
+                "WhoScored saved HTML", type=["html", "htm"], key=f"file_{i}",
+            )
+
+        html_bytes = uploaded.getvalue() if uploaded is not None else who.get("html")
+        home_name, away_name = "", ""
+        if html_bytes is not None:
+            try:
+                home_name, away_name = whoscored_teams(html_bytes, who_url)
+            except SourceError as exc:
+                st.error(f"WhoScored HTML: {exc}")
+                html_bytes = None
+            else:
+                origin = "upload" if uploaded is not None else who["source"]
+                st.caption(f"Match event teams: **{home_name}** (H) vs **{away_name}** (A) · WhoScored {origin}")
                 if not st.session_state.detected_home:
                     st.session_state.detected_home = home_name
                     st.session_state.detected_away = away_name
-            else:
-                st.warning("Team names could not be read; check the saved WhoScored HTML.")
+        elif who_url and not who.get("error"):
+            st.info("Choose Fetch match sources to load WhoScored events.")
 
-        stats_cache = st.session_state.get(f"fotmob_fetch_{i}")
-        if stats_cache and stats_cache["url"] == fotmob_url:
-            stats = stats_cache["stats"]
-            st.caption(f"FotMob source: {stats.extraction}; xG and xGOT values below can be edited.")
+        if fot.get("error"):
+            st.warning(f"FotMob: {fot['error']} Enter missing values below.")
+        stats = fot.get("stats")
+        stats_mismatch = False
+        if stats:
+            check = fixture_names_match(home_name, away_name, stats)
+            stats_mismatch = check is False
+            if stats_mismatch:
+                st.error("FotMob and WhoScored identify different home/away teams. "
+                         "Correct the FotMob URL or clear it and enter verified values manually.")
+            else:
+                if not fot["applied"]:
+                    for field, attribute in STAT_ATTRIBUTES.items():
+                        value = getattr(stats, attribute)
+                        if value is not None:
+                            st.session_state[f"{field}_{i}"] = f"{value:.2f}"
+                    fot = {**fot, "applied": True}
+                    st.session_state[fot_key] = fot
+                if check is None:
+                    st.info("FotMob team names could not be cross-checked against WhoScored events.")
+                if not stats.complete:
+                    st.warning("FotMob returned partial stats. Fill in the missing values manually.")
+                st.caption(f"FotMob source: {stats.extraction}; xG and xGOT values below can be edited.")
+            if stats.home_team and stats.away_team:
+                st.caption(f"FotMob teams: **{stats.home_team}** (H) vs **{stats.away_team}** (A)")
 
         match_label = st.text_input(
             "Match label", key=f"label_{i}",
@@ -514,6 +482,8 @@ for i in range(st.session_state.match_count):
 
         match_inputs.append({
             "html_bytes": html_bytes, "label": match_label,
+            "configured": bool(who_url or fotmob_url or uploaded),
+            "stats_mismatch": stats_mismatch,
             "home_name": home_name, "away_name": away_name,
             "home_xg": parsed_values["hxg"], "home_xgot": parsed_values["hxgot"],
             "away_xg": parsed_values["axg"], "away_xgot": parsed_values["axgot"],
@@ -613,8 +583,18 @@ generate_btn = st.button(
 if generate_btn:
     valid = [m for m in match_inputs if m["html_bytes"] is not None]
 
+    missing_events = [m["label"] for m in match_inputs if m["configured"] and m["html_bytes"] is None]
+    if missing_events:
+        st.error("WhoScored events are unavailable for: " + ", ".join(missing_events) +
+                 ". Check the source status above.")
+        st.stop()
     if not valid:
-        st.error("Load at least one WhoScored match URL or upload a saved HTML file.")
+        st.error("Fetch WhoScored match-centre events from a Live URL or upload saved match-centre HTML.")
+        st.stop()
+
+    mismatches = [m["label"] for m in valid if m["stats_mismatch"]]
+    if mismatches:
+        st.error("Correct the FotMob fixture for: " + ", ".join(mismatches) + ".")
         st.stop()
 
     # Require real, sourced values; never synthesize xG/xGOT defaults.

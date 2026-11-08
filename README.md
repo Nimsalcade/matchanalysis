@@ -1,18 +1,22 @@
 # MATCHANALYSIS
 Hi there, I am SALMAN, data analysis enthusiast. In this repository I have uploaded the code for making Post Match report.
 
-Requirments:
-1. the match report you want to get, you have to find that match in (http://whoscored.com) website and clicking the match center, you have to download the html file (just click CTRL+S, and it will download the html file of that page)
-2. you need to collect the home and away team's xG and xGOT values from any sources and have to put manually in the code
+## Run the app
 
-User's Guideline:
-1. download the PostMatchDashboard.ipynb file
-2. upload and open it on google colab
-3. run the cells under 'Libraries and Packages'
-4. then upload the match html file you have downloaded from Whoscored website
-5. right click on the file and copy path
-6. paste the file path on the first cell under 'EventDataScraping' where denoted whith hashtag 'Put the match html file path here', and run the cell
-7. Paste the home and away team's xG and xGOT values in the next cell and run
-8. then runnuing the remaining cells will give you the output Post Match Reports
+```sh
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
+```
+
+## Generate a report from two URLs
+
+1. Choose **Fetch by URL** and enter the WhoScored Live URL and the FotMob URL for the same fixture.
+2. Click **Fetch match sources**. WhoScored supplies the event HTML. FotMob fills the two teams' xG and xGOT.
+3. If the server cannot load WhoScored, install the [Chrome companion](browser_extension/README.md) once and click **Fetch WhoScored in this browser**. It opens the match in a regular browser tab and sends the embedded event HTML directly to the app.
+4. Once the event teams and xG/xGOT appear, click **Generate Report(s) & Export PDF**. The tactical decoder uses the same event data.
+
+The full report requires a WhoScored Live page with embedded match-centre events. A fixture may have a public Summary page with lineups and goals and no event feed. The app shows missing events separately from an HTTP access error. Saved WhoScored HTML upload and manual entry of verified xG/xGOT are also supported.
+
+Optional server rendering for successful HTTP requests that need JavaScript requires `python -m pip install playwright` and `python -m playwright install chromium` on the server. The Chrome companion runs in the user's browser.
 
 This project is licensed under the GNU General Public License v3.0 - see the LICENSE file for details.
