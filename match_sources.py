@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+import shutil
 import unicodedata
 from urllib.parse import urljoin, urlsplit
 
@@ -22,6 +23,16 @@ USER_AGENT = "MatchAnalysis/1.1 (user-requested single match report; local Strea
 
 class SourceError(ValueError):
     """Invalid input, blocked web fetch, or missing source data."""
+
+
+class SourceHTTPError(SourceError):
+    def __init__(self, site: str, status: int):
+        self.status = status
+        super().__init__(f"{site} returned HTTP {status}.")
+
+
+class MissingEventData(SourceError):
+    """The page did not provide a usable match event payload."""
 
 
 @dataclass(frozen=True)
@@ -60,9 +71,10 @@ def check_source_url(raw: str, site: str) -> str:
         raise SourceError("Invalid URL port.") from exc
     if parts.username or parts.password or has_port:
         raise SourceError("URL credentials and custom ports are not supported.")
-    if not parts.path.startswith("/matches/"):
+    match_path = parts.path.lower() if site == "whoscored" else parts.path
+    if not match_path.startswith("/matches/"):
         raise SourceError("URL must point to a match page (/matches/...).")
-    if site == "whoscored" and not re.match(r"^/matches/\d+(?:/|$)", parts.path):
+    if site == "whoscored" and not re.match(r"^/matches/[0-9]+(?:/|$)", match_path):
         raise SourceError("WhoScored match URL must contain a numeric match ID.")
     if site == "fotmob" and not re.match(r"^/matches/[^/]+/[^/]+", parts.path):
         raise SourceError("FotMob match URL must contain its fixture path.")
@@ -86,10 +98,8 @@ def _http_html(url: str, site: str, session=None) -> bytes:
                     raise SourceError("Redirect contained no destination.")
                 current = check_source_url(urljoin(current, next_url), site)
                 continue
-            if resp.status_code in (401, 403, 429):
-                raise SourceError(f"{site.title()} returned HTTP {resp.status_code}. "
-                                  "The server could not access this page.")
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                raise SourceHTTPError("WhoScored" if site == "whoscored" else "FotMob", resp.status_code)
             kind = resp.headers.get("Content-Type", "").lower()
             if kind and not any(k in kind for k in ("html", "text/plain", "application/xhtml")):
                 raise SourceError(f"Unexpected content type: {kind}.")
@@ -101,18 +111,48 @@ def _http_html(url: str, site: str, session=None) -> bytes:
             if not buf:
                 raise SourceError("Source returned an empty HTML page.")
             return bytes(buf)
-        except requests.HTTPError as exc:
-            raise SourceError(f"{site.title()} returned HTTP {resp.status_code}.") from exc
+        except requests.RequestException as exc:
+            raise SourceError(f"{site.title()} response could not be read: {exc}") from exc
         finally:
             resp.close()
     raise SourceError("Too many redirects.")
 
 
+def _whoscored_fixture_id(url: str) -> str:
+    return urlsplit(check_source_url(url, "whoscored")).path.split("/")[2]
+
+
+def _restrict_whoscored_browser(context, page, fixture_id: str):
+    # CDP also pauses redirect hops. Playwright's route handler sees only the first URL.
+    cdp = context.new_cdp_session(page)
+    main_frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+
+    def check_request(event):
+        request_id = {"requestId": event["requestId"]}
+        request = event["request"]
+        try:
+            parts = urlsplit(request["url"])
+            allowed = (parts.scheme == "https" and parts.netloc.lower() in
+                       {"whoscored.com", "www.whoscored.com"} and request["method"] in {"GET", "HEAD"})
+            if allowed and event["resourceType"] == "Document":
+                allowed = (event.get("frameId") == main_frame and
+                           _whoscored_fixture_id(request["url"]) == fixture_id)
+        except ValueError:
+            allowed = False
+        if allowed:
+            cdp.send("Fetch.continueRequest", request_id)
+        else:
+            cdp.send("Fetch.failRequest", {**request_id, "errorReason": "BlockedByClient"})
+
+    cdp.on("Fetch.requestPaused", check_request)
+    cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*"}]})
+    context.route_web_socket("**/*", lambda socket: socket.close())
+
+
 def _browser_html(url: str, site: str) -> bytes:
     """Optional ordinary browser rendering for client-side match data.
 
-    Only opens the user-supplied match URL; never solves challenges or uses
-    third-party proxy sites. Playwright and a browser installation are optional.
+    Opens the user-supplied match URL without solving challenges or using proxy sites.
     """
     try:
         from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeout, sync_playwright
@@ -120,17 +160,31 @@ def _browser_html(url: str, site: str) -> bytes:
         raise SourceError("Browser rendering requires 'pip install playwright' and "
                           "'python -m playwright install chromium'.") from exc
     url = check_source_url(url, site)
+    label = "WhoScored" if site == "whoscored" else "FotMob"
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
             try:
-                page = browser.new_page()
+                browser = p.chromium.launch(
+                    headless=True, executable_path=shutil.which("chromium"),
+                    ignore_default_args=["--disable-popup-blocking"],
+                )
+            except BrowserError as exc:
+                raise SourceError("Chromium could not start on the server. Install Chromium or run "
+                                  "'python -m playwright install chromium'.") from exc
+            try:
+                context = browser.new_context(service_workers="block", accept_downloads=False)
+                page = context.new_page()
+                if site == "whoscored":
+                    fixture_id = _whoscored_fixture_id(url)
+                    _restrict_whoscored_browser(context, page, fixture_id)
                 response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                if response is None or response.status in (401, 403, 429):
-                    raise SourceError(f"{site.title()} did not allow this browser request.")
+                if response is None:
+                    raise SourceError(f"{label} returned no browser response.")
                 if response.status >= 400:
-                    raise SourceError(f"{site.title()} returned HTTP {response.status}.")
+                    raise SourceHTTPError(label, response.status)
                 page.wait_for_timeout(1800)  # allow normal initial UI hydration
+                if site == "whoscored" and _whoscored_fixture_id(page.url) != fixture_id:
+                    raise SourceError("WhoScored redirected the browser to a different match.")
                 if site == "fotmob":
                     try:
                         page.get_by_role("button", name="Stats", exact=True).first.click(timeout=3000)
@@ -144,9 +198,9 @@ def _browser_html(url: str, site: str) -> bytes:
             finally:
                 browser.close()
     except BrowserTimeout as exc:
-        raise SourceError("Browser rendering timed out.") from exc
+        raise SourceError(f"{label} browser navigation timed out.") from exc
     except BrowserError as exc:
-        raise SourceError("Browser rendering failed. Check that Chromium is installed.") from exc
+        raise SourceError(f"{label} browser navigation failed or redirected outside the permitted match page.") from exc
 
 
 def whoscored_teams(html: bytes, url: str = "") -> tuple[str, str]:
@@ -157,13 +211,13 @@ def whoscored_teams(html: bytes, url: str = "") -> tuple[str, str]:
         home, away = centre["home"]["name"], centre["away"]["name"]
         events = centre["events"]
     except (KeyError, ValueError, TypeError) as exc:
-        raise SourceError("This WhoScored page has no readable match-centre event data.") from exc
+        raise MissingEventData("This WhoScored page has no readable match-centre event data.") from exc
     if not isinstance(events, list) or not events:
-        raise SourceError("This WhoScored page has no match-centre events.")
+        raise MissingEventData("This WhoScored page has no match-centre events.")
     if not all(isinstance(name, str) and name.strip() for name in (home, away)):
         raise SourceError("Team names are missing from the WhoScored event data.")
     if url:
-        fixture_id = urlsplit(check_source_url(url, "whoscored")).path.split("/")[2]
+        fixture_id = _whoscored_fixture_id(url)
         if str(match.get("matchId")) != fixture_id:
             raise SourceError(f"This WhoScored HTML belongs to a different fixture than match {fixture_id}.")
     return home, away
@@ -171,16 +225,17 @@ def whoscored_teams(html: bytes, url: str = "") -> tuple[str, str]:
 
 def fetch_whoscored(url: str, browser_fallback: bool = False, session=None) -> bytes:
     url = check_source_url(url, "whoscored")
-    html = _http_html(url, "whoscored", session=session)
     try:
+        html = _http_html(url, "whoscored", session=session)
         whoscored_teams(html, url)
-    except SourceError:
-        if not browser_fallback:
+    except (SourceHTTPError, MissingEventData) as direct_error:
+        if not browser_fallback or (isinstance(direct_error, SourceHTTPError) and direct_error.status != 403):
             raise
-    else:
-        return html
-    html = _browser_html(url, "whoscored")
-    whoscored_teams(html, url)
+        try:
+            html = _browser_html(url, "whoscored")
+            whoscored_teams(html, url)
+        except SourceError as browser_error:
+            raise SourceError(f"Direct request: {direct_error} Browser request: {browser_error}") from browser_error
     return html
 
 

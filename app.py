@@ -7,17 +7,8 @@ import tempfile
 import io
 import sys
 import time
-from pathlib import Path
-from uuid import uuid4
-from streamlit.components.v1 import declare_component
 from match_sources import (
-    MAX_RESPONSE_BYTES, SourceError, check_source_url, fetch_fotmob,
-    fetch_whoscored, fixture_names_match, whoscored_teams,
-)
-
-fetch_in_browser = declare_component(
-    "browser_fetch_component",
-    path=str(Path(__file__).with_name("browser_fetch_component")),
+    SourceError, fetch_fotmob, fetch_whoscored, fixture_names_match, whoscored_teams,
 )
 
 # ─────────────────────────────────────────────
@@ -208,6 +199,10 @@ def clear_imported_stats(index, cached):
             st.session_state[key] = ""
 
 
+def request_report():
+    st.session_state.generate_requested = True
+
+
 # ─────────────────────────────────────────────
 # SESSION STATE INIT
 # ─────────────────────────────────────────────
@@ -280,15 +275,15 @@ with st.sidebar:
             st.session_state.detected_away = ""
             for key in tuple(st.session_state.keys()):
                 if key.startswith(("match_mode_", "whoscored_url_", "fotmob_url_", "file_",
-                                   "match_download_", "fotmob_fetch_", "label_", "browser_",
+                                   "match_download_", "fotmob_fetch_", "label_",
                                    "hxg_", "hxgot_", "axg_", "axgot_")):
                     st.session_state.pop(key)
             st.rerun()
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.caption(
-        "**Tip:** Paste a WhoScored Live URL and a FotMob match URL, then choose Fetch. "
-        "If WhoScored blocks the server, use the browser companion or upload saved match-centre HTML."
+        "**Tip:** Paste both match URLs and click Generate. "
+        "The app downloads and imports the match sources automatically."
     )
 
 
@@ -312,6 +307,7 @@ st.markdown("<hr/>", unsafe_allow_html=True)
 # ─────────────────────────────────────────────
 # MAIN — MATCH INPUT GRID
 # ─────────────────────────────────────────────
+generate_requested = st.session_state.pop("generate_requested", False)
 match_inputs = []   # downloaded or uploaded bytes, match label and verified metric values
 
 for i in range(st.session_state.match_count):
@@ -342,64 +338,35 @@ for i in range(st.session_state.match_count):
             st.session_state.pop(fot_key)
             fot = {}
 
-        browser_option = st.checkbox(
-            "Try server browser rendering when a page needs JavaScript",
-            value=False, key=f"browser_option_{i}",
-            help="Optional: requires Playwright and Chromium on the server.",
-        )
-        if st.button("Fetch match sources", key=f"fetch_{i}", use_container_width=True):
+        fetch_clicked = st.button("Fetch match sources", key=f"fetch_{i}", use_container_width=True)
+        fetch_who = who_url and (fetch_clicked or (generate_requested and "html" not in who))
+        fetch_fot = fotmob_url and (fetch_clicked or (generate_requested and "stats" not in fot))
+        if fetch_who or fetch_fot:
             with st.spinner("Reading the supplied match pages…"):
-                if who_url:
+                if fetch_who:
                     try:
-                        html = fetch_whoscored(who_url, browser_fallback=browser_option)
+                        html = fetch_whoscored(who_url, browser_fallback=True)
                         who = {"url": who_url, "html": html, "source": "server"}
                     except SourceError as exc:
-                        who = {"url": who_url, "error": str(exc), "request_id": uuid4().hex}
+                        who = {"url": who_url, "error": str(exc)}
                     st.session_state[who_key] = who
-                if fotmob_url:
+                if fetch_fot:
                     try:
-                        stats = fetch_fotmob(fotmob_url, browser_fallback=browser_option)
+                        stats = fetch_fotmob(fotmob_url)
                     except SourceError as exc:
                         fot = {**fot, "url": fotmob_url, "error": str(exc)}
                     else:
                         clear_imported_stats(i, fot)
-                        fot = {"url": fotmob_url, "stats": stats, "applied": False}
+                        fot = {"url": fotmob_url, "stats": stats, "applied": False,
+                               "replace_values": fetch_clicked}
                     st.session_state[fot_key] = fot
-                if not (who_url or fotmob_url):
-                    st.info("Enter a match URL to fetch, or upload HTML and enter the statistics below.")
+        elif fetch_clicked:
+            st.info("Enter a match URL to fetch.")
 
-        uploaded = None
         if who.get("error"):
             st.error(f"WhoScored server fetch: {who['error']}")
-            try:
-                check_source_url(who_url, "whoscored")
-            except SourceError:
-                pass
-            else:
-                st.caption("With the MatchAnalysis browser extension installed, fetch the same URL from your browser.")
-                result = fetch_in_browser(
-                    url=who_url, request_id=who["request_id"], key=f"browser_fetch_{i}",
-                    default=None,
-                )
-                if (isinstance(result, dict) and result.get("url") == who_url
-                        and result.get("request_id") == who["request_id"]):
-                    if isinstance(result.get("html"), str):
-                        try:
-                            html = result["html"].encode("utf-8")
-                            if len(html) > MAX_RESPONSE_BYTES:
-                                raise SourceError("WhoScored HTML exceeds the 16 MB limit.")
-                            whoscored_teams(html, who_url)
-                        except (SourceError, UnicodeError) as exc:
-                            st.error(f"WhoScored browser fetch: {exc}")
-                        else:
-                            st.session_state[who_key] = {
-                                "url": who_url, "html": html, "source": "browser",
-                            }
-                            st.rerun()
-                    elif isinstance(result.get("error"), str):
-                        st.error(f"WhoScored browser fetch: {result['error']}")
-            st.caption("You can also upload saved HTML from this match's WhoScored Live page.")
-        if source_mode == "Upload saved HTML" or who.get("error"):
+        uploaded = None
+        if source_mode == "Upload saved HTML":
             uploaded = st.file_uploader(
                 "WhoScored saved HTML", type=["html", "htm"], key=f"file_{i}",
             )
@@ -418,9 +385,6 @@ for i in range(st.session_state.match_count):
                 if not st.session_state.detected_home:
                     st.session_state.detected_home = home_name
                     st.session_state.detected_away = away_name
-        elif who_url and not who.get("error"):
-            st.info("Choose Fetch match sources to load WhoScored events.")
-
         if fot.get("error"):
             st.warning(f"FotMob: {fot['error']} Enter missing values below.")
         stats = fot.get("stats")
@@ -435,8 +399,9 @@ for i in range(st.session_state.match_count):
                 if not fot["applied"]:
                     for field, attribute in STAT_ATTRIBUTES.items():
                         value = getattr(stats, attribute)
-                        if value is not None:
-                            st.session_state[f"{field}_{i}"] = f"{value:.2f}"
+                        key = f"{field}_{i}"
+                        if value is not None and (fot.get("replace_values", True) or not st.session_state.get(key)):
+                            st.session_state[key] = f"{value:.2f}"
                     fot = {**fot, "applied": True}
                     st.session_state[fot_key] = fot
                 if check is None:
@@ -455,7 +420,7 @@ for i in range(st.session_state.match_count):
             match_label = f"{home_name} vs {away_name}" if home_name else f"Match {i + 1}"
 
         st.markdown("**Match statistics (home and away)**")
-        st.caption("Use FotMob Fetch to populate these fields; edit manually if access is blocked. "
+        st.caption("The app fills these fields from the FotMob URL. You can also enter values manually. "
                    "Blank means unknown, never zero. The legacy PDF renderer needs all four fields.")
         c1, c2, c3, c4 = st.columns(4)
         stat_fields = (
@@ -574,13 +539,14 @@ with st.expander("Tactical decoder — event evidence and match phases", expande
 # ─────────────────────────────────────────────
 # GENERATE BUTTON
 # ─────────────────────────────────────────────
-generate_btn = st.button(
+st.button(
     f"🚀  Generate {st.session_state.match_count} Report(s) & Export PDF",
     type="primary",
     use_container_width=True,
+    on_click=request_report,
 )
 
-if generate_btn:
+if generate_requested:
     valid = [m for m in match_inputs if m["html_bytes"] is not None]
 
     missing_events = [m["label"] for m in match_inputs if m["configured"] and m["html_bytes"] is None]

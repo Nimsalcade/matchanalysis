@@ -8,3 +8,4 @@ highlight_text
 Pillow
 requests
 beautifulsoup4
+playwright>=1.48

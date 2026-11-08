@@ -41,15 +41,15 @@ class SourceWorkflowTests(TestCase):
     def test_blocked_fetch_stays_visible_and_upload_retains_stats(self):
         app = self.load_blocked_match()
         self.assertTrue(any("HTTP 403" in item.value for item in app.error))
-        self.assertEqual(app.file_uploader[0].label, "WhoScored saved HTML")
+        self.assertFalse(app.file_uploader)
 
         generate = next(button for button in app.button if "Generate" in button.label)
-        if generate.proto.disabled:
-            app.run()
-        else:
+        with patch.object(match_sources, "fetch_whoscored", side_effect=SourceError("HTTP 403")):
             generate.click().run()
         self.assertTrue(any("HTTP 403" in item.value for item in app.error))
 
+        app.radio(key="match_mode_0").set_value("Upload saved HTML").run()
+        self.assertEqual(app.file_uploader[0].label, "WhoScored saved HTML")
         with (
             patch.object(match_sources, "fetch_whoscored") as fetch_events,
             patch.object(match_sources, "fetch_fotmob") as fetch_stats,
@@ -68,6 +68,7 @@ class SourceWorkflowTests(TestCase):
 
     def test_upload_checks_already_imported_fotmob_stats(self):
         app = self.load_blocked_match(fotmob_away="Darmstadt")
+        app.radio(key="match_mode_0").set_value("Upload saved HTML").run()
         app.file_uploader[0].upload("match.html", MATCH_HTML, "text/html").run()
 
         self.assertFalse(app.exception)
@@ -80,25 +81,43 @@ class SourceWorkflowTests(TestCase):
                 render.assert_not_called()
         self.assertFalse(app.exception)
 
-    def test_browser_capture_is_bound_to_the_active_request(self):
-        app = self.load_blocked_match()
-        capture = {"url": WHOSCORED, "request_id": "stale", "html": MATCH_HTML.decode()}
-        with patch("streamlit.components.v1.declare_component", return_value=Mock(return_value=capture)):
-            app.run()
-            self.assertFalse(app.session_state["match_download_0"].get("html"))
+    def test_generate_fetches_urls_and_imports_the_downloaded_html(self):
+        stats = FotMobStats(3.98, 0.86, 4.02, 0.64, FOTMOB, "embedded JSON",
+                            "Bayern München", "Magdeburg")
+        app = AppTest.from_file(APP, default_timeout=15).run()
+        app.text_input(key="whoscored_url_0").set_value(WHOSCORED)
+        app.text_input(key="fotmob_url_0").set_value(FOTMOB)
+        app.text_input(key="hxg_0").set_value("4.00")
+        temp_files = []
 
-            capture["request_id"] = app.session_state["match_download_0"]["request_id"]
-            app.run()
+        def render(cmd, **kwargs):
+            source_file = Path(cmd[2])
+            self.assertEqual(source_file.read_bytes(), MATCH_HTML)
+            self.assertEqual(cmd[3:7], ["4.0", "0.86", "4.02", "0.64"])
+            temp_files.append(source_file)
+            return Mock(communicate=Mock(return_value=("", "test renderer")), returncode=1)
+
+        with (
+            patch.object(match_sources, "fetch_whoscored", return_value=MATCH_HTML) as fetch_events,
+            patch.object(match_sources, "fetch_fotmob", return_value=stats) as fetch_stats,
+            patch("subprocess.Popen", side_effect=render),
+        ):
+            next(button for button in app.button if "Generate" in button.label).click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(app.session_state["match_download_0"]["source"], "browser")
+        fetch_events.assert_called_once_with(WHOSCORED, browser_fallback=True)
+        fetch_stats.assert_called_once_with(FOTMOB)
+        self.assertEqual(len(temp_files), 1)
+        self.assertFalse(temp_files[0].exists())
+        self.assertEqual(app.session_state["match_download_0"]["source"], "server")
         self.assertEqual(app.session_state["match_download_0"]["html"], MATCH_HTML)
         self.assertEqual(app.text_input(key="hxgot_0").value, "4.02")
 
 
 class BrowserFallbackTests(TestCase):
-    def test_browser_rendering_does_not_retry_http_access_blocks(self):
-        for fetch, url in ((fetch_whoscored, WHOSCORED), (fetch_fotmob, FOTMOB)):
-            for status in (401, 403, 429):
+    def test_browser_rendering_does_not_retry_unauthorized_or_rate_limited_requests(self):
+        for fetch, url, statuses in ((fetch_whoscored, WHOSCORED, (401, 429)),
+                                     (fetch_fotmob, FOTMOB, (401, 403, 429))):
+            for status in statuses:
                 with self.subTest(provider=fetch.__name__, status=status):
                     session = Mock()
                     session.get.return_value = Mock(status_code=status, headers={})
@@ -106,3 +125,11 @@ class BrowserFallbackTests(TestCase):
                         with self.assertRaisesRegex(SourceError, f"HTTP {status}"):
                             fetch(url, browser_fallback=True, session=session)
                         browser.assert_not_called()
+
+    def test_whoscored_403_uses_one_server_browser_navigation(self):
+        session = Mock()
+        session.get.return_value = Mock(status_code=403, headers={})
+        with patch.object(match_sources, "_browser_html", return_value=MATCH_HTML) as browser:
+            html = fetch_whoscored(WHOSCORED, browser_fallback=True, session=session)
+        self.assertEqual(html, MATCH_HTML)
+        browser.assert_called_once_with(WHOSCORED, "whoscored")
